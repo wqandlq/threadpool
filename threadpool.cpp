@@ -7,13 +7,16 @@
 #include <iostream>
 
 const int TaskQueueMaxThreshHold = 1024;
+const int ThreadSizeThreshHold = 1024;
 
 // 线程池构造
 ThreadPool::ThreadPool() : initThreadSize_(4),
                            poolMode_(PoolMode::MODE_FIXED),
                            task_Size_(0),
                            taskQueMaxThreshHold_(TaskQueueMaxThreshHold),
-                           isPoolRunning_(false)
+                           isPoolRunning_(false),
+                           curThreadSize_(0),
+                           idleThreadSize_(0)
 {
 }
 
@@ -59,45 +62,16 @@ void ThreadPool::setTaskQueMaxThreshHold(int taskQueMaxThreshHold)
     taskQueMaxThreshHold_ = taskQueMaxThreshHold;
 }
 
-// 给线程池提交任务  用户调用submitTask提交任务对象
-// bool ThreadPool::submitTask(std::shared_ptr<Task> task)
-// {
-//     // 获取锁
-//     std::unique_lock<std::mutex> lock(taskQueMtx_);
-//     // 如果线程池没有运行了，就不让提交任务了
-//     if (!isPoolRunning_)
-//     {
-//         std::cerr << "thread pool is not running, submit task failed!" << std::endl;
-//         return false;
-//     }
-//     // 如果在这里等待超过一秒钟还没提交上去，就判断提交任务失败，返回
-//     if (!notFull_.wait_for(lock, std::chrono::seconds(1), [&]() -> bool
-//                            { return tasksQue_.size() < (size_t)taskQueMaxThreshHold_ || !isPoolRunning_; }))
-//     {
-//         // 表示notFull_等待一秒钟，条件依然没有满足
-//         std::cerr << "task queue is full, submit task failed" << std::endl;
-//         return false;
-//     }
-//     // 如果线程池没有运行了，就不让提交任务了
-//     if (!isPoolRunning_)
-//     {
-//         std::cerr << "thread pool is not running, submit task failed!" << std::endl;
-//         return false;
-//     }
-
-//     // 如果有空余，把任务放入任务队列中
-//     tasksQue_.emplace([task]()
-//                       { task->run(); }); // 这里把任务对象的run()方法放入任务队列中，线程池中的线程从任务队列里取出一个任务对象，就执行它的run()方法    
-//     task_Size_++;
-//     // 因为新放了任务，任务队列肯定不空了，在not_Empty上进行通知,赶快分配线程执行任务
-//     notEmpty_.notify_one();
-//     return true;
-// }
-
-// //设置初始的线程数量
-// void ThreadPool::setInitThreadSize(int threadSize) {
-//     initThreadSize_ = threadSize;
-// }
+void ThreadPool::setThreadSizeThreshHold(int theshHold)
+{
+    // 如果线程池已经运行了，就不让设置线程数量上限阈值了
+    if (isPoolRunning_)
+    {
+        std::cerr << "thread pool is already running, can't set thread size thresh hold!" << std::endl;
+        return;
+    }
+    threadSizeThreshHold_ = theshHold;
+}
 
 // 开启线程池
 void ThreadPool::start(int initThreadSize)
@@ -117,6 +91,9 @@ void ThreadPool::start(int initThreadSize)
     initThreadSize_ = initThreadSize;
     isPoolRunning_ = true;
 
+    curThreadSize_ = initThreadSize_;  // 当前线程数量
+    idleThreadSize_ = initThreadSize_; // 空闲线程数量
+
     // 创建线程对象
     for (int i = 0; i < initThreadSize_; i++)
     {
@@ -135,43 +112,73 @@ void ThreadPool::start(int initThreadSize)
 // 定义线程函数    线程池的所有线程从任务队列里消费任务
 void ThreadPool::threadFunc()
 {
-    // std::cout << "begin ThreadPool::threadFunc() tid:" << std::this_thread::get_id() << std::endl;
-    // std::cout << "end ThreadPool::threadFunc()" << std::endl;
-
+    const int THREAD_MAX_IDLE_TIME = 60; // 线程最大空闲时间，单位是秒
     for (;;)
     {
         std::function<void()> task; // 定义一个任务对象，类型是函数对象，初始值是空的
         {
             // 先获取锁
             std::unique_lock<std::mutex> lock(taskQueMtx_);
-            // std::cout << "tid:" << std::this_thread::get_id() << "尝试获取任务..." << std::endl;
-
-            // 等待notEmpty_条件
-            notEmpty_.wait(lock, [&]() -> bool
-                           { return !tasksQue_.empty() || !isPoolRunning_; });
-            // 如果不空，那么就从任务队列中取一个任务出来
-
-            if (!isPoolRunning_ && tasksQue_.empty())
+            if (poolMode_ == MODE_CACHED)
             {
-                // std::cout << "tid:" << std::this_thread::get_id() << "线程池已经关闭，且任务队列已经空了，线程退出！" << std::endl;
-                return;
+                // 线程池是动态的，如果线程空闲时间超过了THREAD_MAX_IDLE_TIME，那么就让线程退出
+                while (tasksQue_.empty() && isPoolRunning_)
+                {
+                    if (notEmpty_.wait_for(lock, std::chrono::seconds(THREAD_MAX_IDLE_TIME)) == std::cv_status::timeout)
+                    {
+                        // 如果线程空闲时间超过了THREAD_MAX_IDLE_TIME，那么就让线程退出
+                        if (curThreadSize_ > initThreadSize_)
+                        {
+                            // 线程空闲时间超过了THREAD_MAX_IDLE_TIME，并且任务队列又空了，并且线程池又是运行的，那么就让线程退出
+                            curThreadSize_--;  // 当前线程数量减1
+                            idleThreadSize_--; // 空闲线程数量减1
+                            return;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // 线程池是固定的，如果任务队列为空了，并且线程池是运行的，那么就让线程等待在notEmpty_条件变量上，等待生产者生产任务了，消费者才有任务可消费了
+                notEmpty_.wait(lock, [&]() -> bool
+                               { return !tasksQue_.empty() || !isPoolRunning_; });
+                // 如果线程池不运行了，并且任务队列又空了，那么就让线程退出
+                if (!isPoolRunning_ && tasksQue_.empty())
+                {
+                    return;
+                }
             }
 
-            // std::cout << "tid:" << std::this_thread::get_id() << "任务获取成功！" << std::endl;
+            // 从任务队列中取出一个任务来执行
             task = tasksQue_.front();
             tasksQue_.pop();
             task_Size_--;
+            idleThreadSize_--; // 空闲线程数量减1
 
             // 取出一个任务，通知可以提交生产任务
             notFull_.notify_one();
         } // 出了这个花括号，就释放锁
 
-        // 当前线程负责执行这个任务  使用多态，用基类指针指向它的run()方法
         if (task)
         {
-            task();// 执行任务对象的run()方法
+            task(); // 执行任务
+            std::unique_lock<std::mutex> lock(taskQueMtx_);
+            idleThreadSize_++; // 执行完任务了，空闲线程数量加1
+            if (task_Size_ == 0 && curThreadSize_ == idleThreadSize_)
+            {
+                allTaskDone_.notify_all(); // 如果任务数量为0了，并且空闲线程数量等于当前线程数量了，那么就通知等待所有任务完成的线程，所有任务都完成了
+            }
         }
     }
+}
+
+void ThreadPool::waitAllTaskDone()
+{
+    // 等待所有任务完成，条件是任务队列为空了，并且任务数量为0了
+    std::unique_lock<std::mutex> lock(taskQueMtx_);
+    // 等待所有任务完成的条件是：空闲线程数量等于当前线程数量，并且任务数量为0了
+    allTaskDone_.wait(lock, [&]() -> bool
+                      { return idleThreadSize_ == curThreadSize_ && task_Size_ == 0; });
 }
 
 /////////////////////////////线程方法实现

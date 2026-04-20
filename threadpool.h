@@ -19,14 +19,6 @@
 #include <utility>
 #include <stdexcept>
 
-// 任务抽象基类
-// 用户可以自定义任意任务类型，从Task继承，重写run方法，实现自定义任务处理
-class Task
-{
-public:
-    virtual ~Task() = default;
-    virtual void run() = 0;
-};
 
 // 线程池支持的模式
 enum PoolMode
@@ -72,11 +64,16 @@ public:
     // 开启线程池
     void start(int initThreadSize = 4);
 
+    void setThreadSizeThreshHold(int theshHold);
+
     // 设置线程池模式
     void setMode(PoolMode mode);
 
     // 设置task任务队列上限阈值
     void setTaskQueMaxThreshHold(int taskQueMaxThreshHold);
+
+    // 等待所有任务完成
+    void waitAllTaskDone();
 
     // 给线程池提交任务
     template <typename Func, typename... Args>
@@ -114,6 +111,16 @@ public:
                               { (*packagedTask)(); });
 
             task_Size_++;
+
+            // 如果线程池的模式是动态的，并且任务数量超过了空闲线程数量，并且当前线程数量没有超过线程数量上限，那么就创建一个新的线程
+            if(poolMode_ ==PoolMode::MODE_CACHED &&task_Size_ > idleThreadSize_ && curThreadSize_ < threadSizeThreshHold_)
+            {
+                std::unique_ptr<Thread> ptr = std::make_unique<Thread>(std::bind(&ThreadPool::threadFunc, this));
+                threads_.emplace_back(std::move(ptr));
+                threads_.back()->start();
+                curThreadSize_++;
+                idleThreadSize_++;
+            }
         }
 
         notEmpty_.notify_one();
@@ -146,6 +153,12 @@ private:
     std::mutex taskQueMtx_;            // 保证任务队列的线程安全
     std::condition_variable notFull_;  // 表示任务队列不满
     std::condition_variable notEmpty_; // 表示任务队列不空
+    std::condition_variable allTaskDone_;
+
+    size_t threadSizeThreshHold_; // 线程数量上限的阈值
+    std::atomic_int curThreadSize_; // 当前线程数量
+    std::atomic_int idleThreadSize_; // 空闲线程数量
+
 };
 
 #endif // THREADPOOL_THREADPOOL_H

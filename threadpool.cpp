@@ -16,7 +16,9 @@ ThreadPool::ThreadPool() : initThreadSize_(4),
                            taskQueMaxThreshHold_(TaskQueueMaxThreshHold),
                            isPoolRunning_(false),
                            curThreadSize_(0),
-                           idleThreadSize_(0)
+                           idleThreadSize_(0),
+                           threadSizeThreshHold_(ThreadSizeThreshHold)
+
 {
 }
 
